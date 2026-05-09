@@ -1,15 +1,20 @@
-!pip install speechrecognition openai-whisper
 import os
-import json
+import glob
 import warnings
-import numpy as np
+import tempfile
+import streamlit as st
 import speech_recognition as sr
 import whisper
+import PyPDF2
+
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 
-# Suppress warnings for cleaner terminal output
+# CONFIG
+
+PDF_DIRECTORY = "my_pdfs"
 warnings.filterwarnings("ignore")
 
-# Configuration & Global Variables
-KNOWLEDGE_BASE_FILE = "my_pdf_embeddings.json"
+st.set_page_config(page_title="Offline Edge RAG", layout="wide")
+
+st.title("📚 Offline Edge RAG System")
