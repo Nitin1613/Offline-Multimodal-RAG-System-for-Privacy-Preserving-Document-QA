@@ -1,195 +1,358 @@
-!pip install speechrecognition openai-whisper
 import os
-import json
+import glob
 import warnings
-import numpy as np
+import tempfile
+import streamlit as st
 import speech_recognition as sr
 import whisper
+import PyPDF2
+
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 
-# Suppress warnings for cleaner terminal output
+# CONFIG
+
+PDF_DIRECTORY = "my_pdfs"
 warnings.filterwarnings("ignore")
 
-# Configuration & Global Variables
-KNOWLEDGE_BASE_FILE = "my_pdf_embeddings.json"
+st.set_page_config(page_title="Offline Edge RAG", layout="wide")
 
-print("Loading local AI models... (This may take a moment and requires internet on the FIRST run)")
+st.title("📚 Offline Edge RAG System")
 
-# 1. Load Local Embedding Model
-# all-MiniLM-L6-v2 is ultra-fast and uses ~100MB of RAM
-print("[1/3] Loading Embedder...")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# LOAD MODELS
 
-# 2. Load Local LLM (Qwen2.5-0.5B-Instruct)
-# Ultra-lightweight LLM,runs well on edge CPU
-print("[2/3] Loading LLM...")
-llm_pipeline = pipeline(
-    "text-generation",
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    device_map="auto" #auto-select GPU if available, otherwise runs on CPU
-)
+@st.cache_resource
+def load_models():
 
-# 3. Load Local ASR (Whisper Base)
-print("[3/3] Loading Whisper Voice Model")
-asr_model = whisper.load_model("base") # ~140MB model
+    embedder = SentenceTransformer(
+        "nomic-ai/nomic-embed-text-v1.5",
+        trust_remote_code=True
+    )
 
-print("All models loaded successfully!\n")
+    llm_pipeline = pipeline(
+        "text-generation",
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        device_map="auto"
+    )
 
-# 1. Input Handling (Offline Voice or Text)
-def get_user_input():
-    print("Choose input method:")
-    print("1. Text")
-    print("2. Voice (Local Whisper)")
-    choice = input("Enter 1 or 2: ").strip()
+    asr_model = whisper.load_model("base")
 
-    if choice == '2':
-        recognizer = sr.Recognizer()
-        with sr.Microphone() as source:
-            print("\nListening... Please speak your query.")
-            recognizer.adjust_for_ambient_noise(source)
-            try:
-                # Capture the audio
-                audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
+    return embedder, llm_pipeline, asr_model
 
-                # Save temporarily to process with local Whisper
-                temp_wav = "temp_audio.wav"
-                with open(temp_wav, "wb") as f:
-                    f.write(audio.get_wav_data())
 
-                print("Transcribing locally...")
-                result = asr_model.transcribe(temp_wav)
-                text = result["text"].strip()
+with st.spinner("Loading Models..."):
+    embedder, llm_pipeline, asr_model = load_models()
 
-                # Cleanup
-                if os.path.exists(temp_wav):
-                    os.remove(temp_wav)
+st.success("Models Loaded Successfully")
 
-                print(f"Transcribed Text: '{text}'\n")
-                return text
+# CHUNKING
 
-            except sr.WaitTimeoutError:
-                print("Listening timed out. Falling back to text input.")
-            except Exception as e:
-                print(f"Voice input error: {e}. Falling back to text input.")
+def get_text_chunks(text, chunk_size=1000, overlap=100):
 
-    # Default to text input
-    return input("\nEnter your text query: ").strip()
+    chunks = []
+    start = 0
 
-# 2. RAG / Knowledge Base Prep & Retrieval
-def load_and_prepare_knowledge_base(kb_path):
-    """
-    Loads the JSON. Because the original JSON contains Google embeddings,
-    we must re-embed the text chunks using our local MiniLM model.
-    """
-    if not os.path.exists(kb_path):
-        raise FileNotFoundError(f"Knowledge base file '{kb_path}' not found.")
+    while start < len(text):
 
-    with open(kb_path, 'r', encoding='utf-8') as f:
-        knowledge_base = json.load(f)
+        end = start + chunk_size
+        chunks.append(text[start:end])
 
-    print("Preparing local embeddings for the knowledge base...")
-    local_kb =[]
+        start += (chunk_size - overlap)
 
-    # Re-embed using the local model
-    for item in knowledge_base:
-        chunk_text = item.get("text", "")
-        if chunk_text:
-            # Generate local 384-dimensional embedding
-            local_embedding = embedder.encode(chunk_text, convert_to_tensor=True)
+    return chunks
+
+# PDF EXTRACTION
+
+def extract_text_from_pdfs(directory_path):
+
+    all_chunks = []
+
+    pdf_files = glob.glob(
+        os.path.join(directory_path, "*.pdf")
+    )
+
+    if not pdf_files:
+        st.error(f"No PDFs found in '{directory_path}'")
+        return []
+
+    for pdf_file in pdf_files:
+
+        st.write(f"Loading: {os.path.basename(pdf_file)}")
+
+        text = ""
+
+        try:
+            with open(pdf_file, "rb") as f:
+
+                reader = PyPDF2.PdfReader(f)
+
+                for page in reader.pages:
+
+                    extracted = page.extract_text()
+
+                    if extracted:
+                        text += extracted + "\n"
+
+            pdf_chunks = get_text_chunks(text)
+
+            all_chunks.extend(pdf_chunks)
+
+        except Exception as e:
+            st.error(f"Error reading {pdf_file}: {e}")
+
+    return all_chunks
+
+# KNOWLEDGE BASE
+
+@st.cache_resource
+def prepare_knowledge_base():
+
+    chunks = extract_text_from_pdfs(PDF_DIRECTORY)
+
+    local_kb = []
+
+    for chunk in chunks:
+
+        if chunk.strip():
+
+            embedding = embedder.encode(
+                chunk,
+                convert_to_tensor=True
+            )
+
             local_kb.append({
-                "text": chunk_text,
-                "embedding": local_embedding
+                "text": chunk,
+                "embedding": embedding
             })
 
     return local_kb
 
+# RETRIEVAL
+
 def retrieve_context(query, local_kb, top_k=3):
-    """Embeds the query and finds the top_k most similar chunks locally."""
-    query_embedding = embedder.encode(query, convert_to_tensor=True)
 
-    scored_chunks =[]
+    query_embedding = embedder.encode(
+        query,
+        convert_to_tensor=True
+    )
+
+    scored_chunks = []
+
     for item in local_kb:
-        # Compute cosine similarity using sentence-transformers util
-        score = util.cos_sim(query_embedding, item["embedding"]).item()
-        scored_chunks.append((score, item["text"]))
 
-    # Sort by descending cosine similarity score
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+        score = util.cos_sim(
+            query_embedding,
+            item["embedding"]
+        ).item()
 
-    # Return the text of the top K highest-scoring chunks
-    return [chunk[1] for chunk in scored_chunks[:top_k]]
+        scored_chunks.append(
+            (score, item["text"])
+        )
 
-# 3. Prompt Augmentation & Local LLM Summarization
+    scored_chunks.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    return [x[1] for x in scored_chunks[:top_k]]
+
+# ANSWER GENERATION
+
 def generate_answer(query, context_chunks):
-    """Combines query and context, then queries the local Qwen LLM."""
 
     context_text = "\n\n---\n\n".join(context_chunks)
 
-    # Format messages using the standard Chat format
-    messages =[
+    messages = [
         {
             "role": "system",
-            "content": "You are a highly capable, local AI assistant. Please answer the user's query based ONLY on the provided context. If the context does not contain the answer, say 'I cannot find the answer in the provided context.'"
+            "content":
+            "Answer ONLY using the provided context."
         },
         {
             "role": "user",
-            "content": f"Context:\n{context_text}\n\nUser Query:\n{query}"
+            "content":
+            f"Context:\n{context_text}\n\nQuestion:\n{query}"
         }
     ]
 
-    # Apply the model's specific chat template
     prompt = llm_pipeline.tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
 
-    # Generate the output
     outputs = llm_pipeline(
         prompt,
         max_new_tokens=256,
-        temperature=0.3, # Low temperature for factual RAG responses
+        temperature=0.3,
         do_sample=True
     )
 
-    # Extract only the generated answer (strip the prompt)
     generated_text = outputs[0]["generated_text"]
+
     answer = generated_text[len(prompt):].strip()
 
     return answer
 
-# Main Flow
-def main():
-    print("=== Offline Edge RAG System ===\n")
+# PREPARE KB
 
-    # Step 1: Load and compute local embeddings (done once in memory)
-    try:
-        local_kb = load_and_prepare_knowledge_base(KNOWLEDGE_BASE_FILE)
-    except Exception as e:
-        print(f"Failed to load knowledge base: {e}")
-        return
+with st.spinner("Preparing Knowledge Base..."):
+    local_kb = prepare_knowledge_base()
 
-    while True:
-        # Step 2: Get Query
-        query = get_user_input()
+st.success(f"Knowledge Base Ready ({len(local_kb)} chunks)")
+
+# SESSION STATE
+
+if "recording" not in st.session_state:
+    st.session_state.recording = False
+
+if "audio_data" not in st.session_state:
+    st.session_state.audio_data = None
+
+if "voice_query" not in st.session_state:
+    st.session_state.voice_query = ""
+
+
+# INPUT METHOD
+
+method = st.radio(
+    "Choose Input Method",
+    ["Text", "Voice"]
+)
+
+query = ""
+
+# TEXT INPUT
+
+if method == "Text":
+
+    query = st.text_input(
+        "Enter your question"
+    )
+
+    if st.button("Answer Query"):
+
         if not query:
-            print("Empty query provided. Exiting.")
-            break
+            st.warning("Please enter a question")
 
-        print("\n[1/2] Searching local knowledge base...")
-        relevant_contexts = retrieve_context(query, local_kb, top_k=3)
+        else:
 
-        print("[2/2] Generating answer using local LLM...\n")
-        answer = generate_answer(query, relevant_contexts)
+            with st.spinner("Searching Knowledge Base..."):
 
-        print("================== ANSWER ==================")
-        print(answer)
-        print("============================================\n")
+                contexts = retrieve_context(
+                    query,
+                    local_kb
+                )
 
-        cont = input("Ask another question? (y/n): ").strip().lower()
-        if cont != 'y':
-            break
+            with st.spinner("Generating Answer..."):
 
-if __name__ == "__main__":
-    main()
+                answer = generate_answer(
+                    query,
+                    contexts
+                )
+
+            st.subheader("Answer")
+            st.write(answer)
+ 
+
+# VOICE INPUT
+
+else:
+
+    from streamlit_mic_recorder import mic_recorder
+
+    st.write("### 🎤 Voice Query")
+
+    audio = mic_recorder(
+        start_prompt="🎙 Start Recording",
+        stop_prompt="⏹ Stop Recording",
+        just_once=True,
+        use_container_width=True
+    )
+
+    # TRANSCRIBE
+
+
+    if audio:
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".wav"
+        ) as temp_audio:
+
+            temp_audio.write(audio["bytes"])
+
+            temp_path = temp_audio.name
+
+        with st.spinner("Transcribing Audio..."):
+
+            result = asr_model.transcribe(
+                temp_path
+            )
+
+            st.session_state.voice_query = (
+                result["text"].strip()
+            )
+
+        os.remove(temp_path)
+
+        st.success("Transcription Completed")
+
+    # SHOW TRANSCRIBED TEXT
+
+    if "voice_query" not in st.session_state:
+        st.session_state.voice_query = ""
+
+    st.session_state.voice_query = st.text_area(
+        "Transcribed Query",
+        value=st.session_state.voice_query,
+        height=120
+    )
+    
+    # ANSWER BUTTON
+
+    if st.button("Answer Query"):
+
+        query = st.session_state.voice_query
+
+        if not query:
+
+            st.warning("No query found")
+
+        else:
+
+            with st.spinner(
+                "Searching Knowledge Base..."
+            ):
+
+                contexts = retrieve_context(
+                    query,
+                    local_kb
+                )
+
+            with st.spinner(
+                "Generating Answer..."
+            ):
+
+                answer = generate_answer(
+                    query,
+                    contexts
+                )
+
+            st.subheader("Answer")
+            st.write(answer)
+
+            with st.expander(
+                "Retrieved Context"
+            ):
+
+                for i, ctx in enumerate(
+                    contexts,
+                    1
+                ):
+
+                    st.markdown(
+                        f"### Chunk {i}"
+                    )
+
+                    st.write(ctx)
