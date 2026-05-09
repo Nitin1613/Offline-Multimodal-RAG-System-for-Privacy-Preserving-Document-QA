@@ -1,43 +1,144 @@
-# 2. RAG / Knowledge Base Prep & Retrieval
-def load_and_prepare_knowledge_base(kb_path):
-    """
-    Loads the JSON. Because the original JSON contains Google embeddings,
-    we must re-embed the text chunks using our local MiniLM model.
-    """
-    if not os.path.exists(kb_path):
-        raise FileNotFoundError(f"Knowledge base file '{kb_path}' not found.")
+# TEXT CHUNKING
 
-    with open(kb_path, 'r', encoding='utf-8') as f:
-        knowledge_base = json.load(f)
+def get_text_chunks(
+    text,
+    chunk_size=1000,
+    overlap=100
+):
 
-    print("Preparing local embeddings for the knowledge base...")
-    local_kb =[]
+    chunks = []
 
-    # Re-embed using the local model
-    for item in knowledge_base:
-        chunk_text = item.get("text", "")
-        if chunk_text:
-            # Generate local 384-dimensional embedding
-            local_embedding = embedder.encode(chunk_text, convert_to_tensor=True)
+    start = 0
+
+    while start < len(text):
+
+        end = start + chunk_size
+
+        chunks.append(text[start:end])
+
+        start += (chunk_size - overlap)
+
+    return chunks
+# PDF EXTRACTION
+
+def extract_text_from_pdfs(directory_path):
+
+    all_chunks = []
+
+    pdf_files = glob.glob(
+        os.path.join(directory_path, "*.pdf")
+    )
+
+    if not pdf_files:
+
+        st.error(
+            f"No PDFs found in '{directory_path}'"
+        )
+
+        return []
+
+    for pdf_file in pdf_files:
+
+        st.write(
+            f"Loading: {os.path.basename(pdf_file)}"
+        )
+
+        text = ""
+
+        try:
+
+            with open(pdf_file, "rb") as f:
+
+                reader = PyPDF2.PdfReader(f)
+
+                for page in reader.pages:
+
+                    extracted = page.extract_text()
+
+                    if extracted:
+
+                        text += extracted + "\n"
+
+            pdf_chunks = get_text_chunks(text)
+
+            all_chunks.extend(pdf_chunks)
+
+        except Exception as e:
+
+            st.error(
+                f"Error reading {pdf_file}: {e}"
+            )
+
+    return all_chunks
+
+# KNOWLEDGE BASE CREATION
+
+@st.cache_resource
+def prepare_knowledge_base():
+
+    chunks = extract_text_from_pdfs(
+        PDF_DIRECTORY
+    )
+
+    local_kb = []
+
+    for chunk in chunks:
+
+        if chunk.strip():
+
+            embedding = embedder.encode(
+                chunk,
+                convert_to_tensor=True
+            )
+
             local_kb.append({
-                "text": chunk_text,
-                "embedding": local_embedding
+                "text": chunk,
+                "embedding": embedding
             })
 
     return local_kb
 
-def retrieve_context(query, local_kb, top_k=3):
-    """Embeds the query and finds the top_k most similar chunks locally."""
-    query_embedding = embedder.encode(query, convert_to_tensor=True)
+# RETRIEVAL
 
-    scored_chunks =[]
+def retrieve_context(
+    query,
+    local_kb,
+    top_k=3
+):
+
+    query_embedding = embedder.encode(
+        query,
+        convert_to_tensor=True
+    )
+
+    scored_chunks = []
+
     for item in local_kb:
-        # Compute cosine similarity using sentence-transformers util
-        score = util.cos_sim(query_embedding, item["embedding"]).item()
-        scored_chunks.append((score, item["text"]))
 
-    # Sort by descending cosine similarity score
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+        score = util.cos_sim(
+            query_embedding,
+            item["embedding"]
+        ).item()
 
-    # Return the text of the top K highest-scoring chunks
-    return [chunk[1] for chunk in scored_chunks[:top_k]]
+        scored_chunks.append(
+            (score, item["text"])
+        )
+
+    scored_chunks.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    return [
+        x[1]
+        for x in scored_chunks[:top_k]
+    ]
+
+
+with st.spinner("Preparing Knowledge Base..."):
+
+    local_kb = prepare_knowledge_base()
+
+st.success(
+    f"Knowledge Base Ready ({len(local_kb)} chunks)"
+)
