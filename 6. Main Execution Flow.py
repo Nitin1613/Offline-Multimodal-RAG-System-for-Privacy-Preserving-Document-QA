@@ -1,34 +1,49 @@
-# Main Flow
-def main():
-    print("=== Offline Edge RAG System ===\n")
+if st.button("Answer Query"):
 
-    # Step 1: Load and compute local embeddings (done once in memory)
-    try:
-        local_kb = load_and_prepare_knowledge_base(KNOWLEDGE_BASE_FILE)
-    except Exception as e:
-        print(f"Failed to load knowledge base: {e}")
-        return
+    if not query:
 
-    while True:
-        # Step 2: Get Query
-        query = get_user_input()
-        if not query:
-            print("Empty query provided. Exiting.")
-            break
+        st.warning("Please enter a query")
 
-        print("\n[1/2] Searching local knowledge base...")
-        relevant_contexts = retrieve_context(query, local_kb, top_k=3)
+    else:
 
-        print("[2/2] Generating answer using local LLM...\n")
-        answer = generate_answer(query, relevant_contexts)
+        # RETRIEVE CONTEXT
 
-        print("================== ANSWER ==================")
-        print(answer)
-        print("============================================\n")
+        with st.spinner(
+            "Searching Knowledge Base..."
+        ):
 
-        cont = input("Ask another question? (y/n): ").strip().lower()
-        if cont != 'y':
-            break
+            contexts = retrieve_context(
+                query,
+                local_kb
+            )
 
-if __name__ == "__main__":
-    main()
+        # GENERATE ANSWER
+
+        with st.spinner(
+            "Generating Answer..."
+        ):
+
+            answer = generate_answer(
+                query,
+                contexts
+            )
+        # DISPLAY OUTPUT
+
+        st.subheader("Answer")
+
+        st.write(answer)
+
+        with st.expander(
+            "Retrieved Context"
+        ):
+
+            for i, ctx in enumerate(
+                contexts,
+                1
+            ):
+
+                st.markdown(
+                    f"### Chunk {i}"
+                )
+
+                st.write(ctx)
